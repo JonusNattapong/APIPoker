@@ -1,5 +1,5 @@
 import json
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -10,20 +10,32 @@ import json
 from . import models, schemas, database, auth
 from .poker_logic import PokerGame, decide_winner
 from .ai_agent import ai_choose_action
+from database import engine, SessionLocal, get_db
+from auth import get_current_user
+from tournaments import tournament_router
+from ml_models.poker_model import PokerAIModel
+from websockets.handlers import handle_websocket_connection
 
-app = FastAPI(title="APIPoker - Production-ready Poker API")
+app = FastAPI(title="APIPoker Backend", description="Backend API for APIPoker platform")
 
-# CORS middleware
+# Set up CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, limit this to your frontend URL
+    allow_origins=["*"],  # In production, replace with specific origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Include tournament router
+app.include_router(tournament_router)
+
 # Initialize database
-models.Base.metadata.create_all(bind=database.engine)
+# Create database tables
+models.Base.metadata.create_all(bind=engine)
+
+# Initialize ML model for AI
+ai_model = PokerAIModel()
 
 # Dependency
 def get_db():
@@ -282,6 +294,86 @@ def showdown(game_id: int, db: Session = Depends(get_db),
             db.commit()
     
     return {"message": "Showdown completed", "winners": winners, "pot_per_winner": pot_per_winner}
+
+# WebSocket endpoint for real-time game updates
+@app.websocket("/ws/{game_id}/{username}")
+async def websocket_endpoint(
+    websocket: WebSocket, 
+    game_id: str, 
+    username: str,
+    db: Session = Depends(get_db)
+):
+    await handle_websocket_connection(websocket, game_id, username, db)
+
+# AI Action endpoint - use ML model for decision making
+@app.get("/ai/action/{game_id}/{ai_name}")
+async def ai_action(
+    game_id: int, 
+    ai_name: str,
+    db: Session = Depends(get_db)
+):
+    game = db.query(models.Game).filter(models.Game.id == game_id).first()
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    # Parse game state
+    import json
+    game_state = json.loads(game.state)
+    
+    # Get AI decision using ML model
+    decision = ai_model.predict_action(game_state, ai_name)
+    
+    return {
+        "action": decision["action"],
+        "amount": decision["amount"],
+        "ai_name": ai_name
+    }
+
+# Add leaderboard endpoint
+@app.get("/leaderboard", response_model=List[schemas.LeaderboardEntry])
+async def get_leaderboard(
+    time_period: str = "all",  # all, month, week
+    limit: int = 10,
+    db: Session = Depends(get_db)
+):
+    from sqlalchemy import func, desc
+    from datetime import datetime, timedelta
+    
+    query = db.query(
+        models.User.id,
+        models.User.username,
+        models.User.tournaments_played,
+        models.User.tournaments_won,
+        models.User.total_winnings,
+        models.User.rank_points
+    )
+    
+    # Apply time period filter if needed
+    if time_period == "month":
+        # Logic for monthly leaderboard
+        month_ago = datetime.now() - timedelta(days=30)
+        query = query.filter(models.User.created_at >= month_ago)
+    elif time_period == "week":
+        # Logic for weekly leaderboard
+        week_ago = datetime.now() - timedelta(days=7)
+        query = query.filter(models.User.created_at >= week_ago)
+    
+    # Get results ordered by rank points
+    users = query.order_by(desc(models.User.rank_points)).limit(limit).all()
+    
+    # Format results
+    result = []
+    for user in users:
+        result.append({
+            "user_id": user.id,
+            "username": user.username,
+            "tournaments_played": user.tournaments_played,
+            "tournaments_won": user.tournaments_won,
+            "total_winnings": float(user.total_winnings),
+            "rank_points": user.rank_points
+        })
+    
+    return result
 
 if __name__ == "__main__":
     import uvicorn
